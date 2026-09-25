@@ -52,12 +52,16 @@ pub(crate) fn candidates(preferred: Option<&str>) -> impl Iterator<Item = String
         }))
 }
 
-/// `[a-z0-9-]{3,40}` with no hyphen at either edge.
+/// A preferred label: `[a-z0-9-]{3,40}` with no hyphen at either edge.
 fn is_valid(label: &str) -> bool {
-    (3..=40).contains(&label.len())
-        && label
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    (3..=40).contains(&label.len()) && is_ldh(label)
+}
+
+/// Lowercase letters, digits and inner hyphens only.
+fn is_ldh(label: &str) -> bool {
+    label
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !label.starts_with('-')
         && !label.ends_with('-')
 }
@@ -86,12 +90,7 @@ impl ClusterDomain {
     // The apex is runtime config, so this is a function rather than FromStr/serde.
     pub(crate) fn parse(name: &str, apex: &str) -> Option<Self> {
         let label = name.strip_suffix(apex)?.strip_suffix('.')?;
-        let valid = (1..=63).contains(&label.len())
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !label.starts_with('-')
-            && !label.ends_with('-');
+        let valid = (1..=63).contains(&label.len()) && is_ldh(label);
         valid.then(|| Self(name.to_owned()))
     }
 
