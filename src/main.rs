@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = PgPool::connect(&required("DATABASE_URL")?).await?;
     MIGRATOR.run(&db).await?;
     let aws = aws_config::load_from_env().await;
-    let zone = Route53::new(&aws, required("HOSTED_ZONE_ID")?);
+    let zone = Route53::new(&aws, required("ROUTE53_HOSTED_ZONE_ID")?);
     let ca = Acme::new(
         AcmeConfig {
             directory_url: required("ACME_DIRECTORY_URL")?,
@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db.clone(),
     );
     let config = Config {
-        apex: required("APEX_DOMAIN")?,
+        apex: required("HOSTED_DNS_APEX")?,
         mints_per_hour: optional("MINTS_PER_HOUR")?.unwrap_or(30),
         client_ip_header: optional("CLIENT_IP_HEADER")?,
         mint_keys: std::env::var("MINT_KEYS")
