@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hosted_dns::{AppState, Config, MIGRATOR, Route53, reap, router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use hosted_dns::{Acme, AcmeConfig, AppState, Config, MIGRATOR, Route53, reap, router};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -12,6 +14,10 @@ const REAP_EVERY: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // sqlx pulls in ring and hyper-rustls aws-lc-rs; rustls needs to be told which to use.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("no other crypto provider is installed first");
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -23,12 +29,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     MIGRATOR.run(&db).await?;
     let aws = aws_config::load_from_env().await;
     let zone = Route53::new(&aws, required("HOSTED_ZONE_ID")?);
+    let ca = Acme::new(
+        AcmeConfig {
+            directory_url: required("ACME_DIRECTORY_URL")?,
+            eab_kid: required("ACME_EAB_KID")?,
+            eab_hmac: URL_SAFE_NO_PAD
+                .decode(required("ACME_EAB_HMAC_KEY")?.trim_end_matches('='))
+                .map_err(|_| "ACME_EAB_HMAC_KEY is not base64url")?,
+        },
+        db.clone(),
+    );
     let config = Config {
         apex: required("APEX_DOMAIN")?,
         mints_per_hour: optional("MINTS_PER_HOUR")?.unwrap_or(30),
         client_ip_header: optional("CLIENT_IP_HEADER")?,
     };
-    let state = Arc::new(AppState::new(db, zone, config));
+    let state = Arc::new(AppState::new(db, zone, ca, config));
 
     let reaper = Arc::clone(&state);
     tokio::spawn(async move {

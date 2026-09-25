@@ -6,6 +6,8 @@ pub enum RecordType {
     A,
     Aaaa,
     Cname,
+    /// Unquoted values; the provider adds and strips the quotes.
+    Txt,
 }
 
 /// One Route 53 resource record set.
@@ -24,6 +26,10 @@ pub enum Change {
     Upsert(RecordSet),
     Delete(RecordSet),
 }
+
+/// Identifies an applied batch so callers can wait for it to reach every nameserver.
+#[derive(Clone, Debug)]
+pub struct ChangeId(pub String);
 
 /// The DNS provider refused or failed a call.
 #[derive(Debug, thiserror::Error)]
@@ -47,5 +53,16 @@ pub trait Zone: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`ZoneError`] when the provider rejects or fails the batch.
-    fn apply(&self, changes: Vec<Change>) -> impl Future<Output = Result<(), ZoneError>> + Send;
+    fn apply(
+        &self,
+        changes: Vec<Change>,
+    ) -> impl Future<Output = Result<ChangeId, ZoneError>> + Send;
+
+    /// Waits until the batch is served by every authoritative nameserver.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZoneError`] when the provider call fails or the wait times out.
+    fn wait_in_sync(&self, change: &ChangeId)
+    -> impl Future<Output = Result<(), ZoneError>> + Send;
 }

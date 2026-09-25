@@ -1,15 +1,17 @@
-//! HTTP API tests against a fake Route 53 and a throwaway Postgres container.
+//! HTTP API tests against a fake Route 53, a fake ACME CA and a throwaway Postgres container.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use hosted_dns::{
-    AppState, Change, Config, MIGRATOR, RecordSet, RecordType, Zone, ZoneError, reap, router,
+    AppState, Ca, CaError, Change, ChangeId, Config, MIGRATOR, RecordSet, RecordType, Zone,
+    ZoneError, reap, router,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -21,25 +23,40 @@ use tower::ServiceExt;
 
 const APEX: &str = "ployz.test";
 
-/// Route 53 semantics in memory: batches are atomic and a delete must match exactly.
+type Sets = HashMap<(String, RecordType), RecordSet>;
+
+/// Route 53 semantics in memory: batches are atomic, a delete must match
+/// exactly, and changes reach the public view (what resolvers see) only once
+/// someone waits for them to sync.
 #[derive(Clone, Default)]
-struct FakeZone(Arc<Mutex<HashMap<(String, RecordType), RecordSet>>>);
+struct FakeZone {
+    sets: Arc<Mutex<Sets>>,
+    public: Arc<Mutex<Sets>>,
+}
 
 impl FakeZone {
     fn values(&self, name: &str, kind: RecordType) -> Option<Vec<String>> {
-        let sets = self.0.lock().unwrap();
+        let sets = self.sets.lock().unwrap();
         sets.get(&(name.to_owned(), kind))
             .map(|set| set.values.clone())
     }
 
+    fn resolve(&self, name: &str, kind: RecordType) -> Vec<String> {
+        let public = self.public.lock().unwrap();
+        public
+            .get(&(name.to_owned(), kind))
+            .map(|set| set.values.clone())
+            .unwrap_or_default()
+    }
+
     fn is_empty(&self) -> bool {
-        self.0.lock().unwrap().is_empty()
+        self.sets.lock().unwrap().is_empty()
     }
 }
 
 impl Zone for FakeZone {
     async fn record_sets(&self, name: &str) -> Result<Vec<RecordSet>, ZoneError> {
-        let sets = self.0.lock().unwrap();
+        let sets = self.sets.lock().unwrap();
         Ok(sets
             .values()
             .filter(|set| set.name == name)
@@ -47,8 +64,8 @@ impl Zone for FakeZone {
             .collect())
     }
 
-    async fn apply(&self, changes: Vec<Change>) -> Result<(), ZoneError> {
-        let mut sets = self.0.lock().unwrap();
+    async fn apply(&self, changes: Vec<Change>) -> Result<ChangeId, ZoneError> {
+        let mut sets = self.sets.lock().unwrap();
         let mut next = sets.clone();
         for change in changes {
             match change {
@@ -63,14 +80,79 @@ impl Zone for FakeZone {
             }
         }
         *sets = next;
+        Ok(ChangeId("change".into()))
+    }
+
+    async fn wait_in_sync(&self, _change: &ChangeId) -> Result<(), ZoneError> {
+        *self.public.lock().unwrap() = self.sets.lock().unwrap().clone();
         Ok(())
+    }
+}
+
+/// An ACME CA that validates DNS-01 by resolving through the fake zone.
+#[derive(Clone)]
+struct FakeCa {
+    zone: FakeZone,
+    rate_limit_next_order: Arc<Mutex<Option<Duration>>>,
+    refuse_next_finalize: Arc<Mutex<bool>>,
+}
+
+struct FakeOrder {
+    names: Vec<String>,
+    values: Vec<String>,
+}
+
+impl Ca for FakeCa {
+    type Order = FakeOrder;
+
+    async fn new_order(&self, names: &[String]) -> Result<(FakeOrder, Vec<String>), CaError> {
+        if let Some(delay) = self.rate_limit_next_order.lock().unwrap().take() {
+            return Err(CaError::RateLimited {
+                until: SystemTime::now() + delay,
+            });
+        }
+        let values: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("dns01-{i}-{name}"))
+            .collect();
+        let order = FakeOrder {
+            names: names.to_vec(),
+            values: values.clone(),
+        };
+        Ok((order, values))
+    }
+
+    async fn finalize(&self, order: FakeOrder, csr_der: &[u8]) -> Result<String, CaError> {
+        if std::mem::take(&mut *self.refuse_next_finalize.lock().unwrap()) {
+            return Err(CaError::Failed(
+                "urn:ietf:params:acme:error:serverInternal".into(),
+            ));
+        }
+        for name in &order.names {
+            let base = name.trim_start_matches("*.");
+            let published = self
+                .zone
+                .resolve(&format!("_acme-challenge.{base}"), RecordType::Txt);
+            if !order.values.iter().all(|value| published.contains(value)) {
+                return Err(CaError::Failed(format!("dns-01 failed for {name}")));
+            }
+        }
+        let csr = String::from_utf8_lossy(csr_der);
+        assert!(order.names.iter().all(|name| csr.contains(name.as_str())));
+        Ok(format!(
+            "-----BEGIN CERTIFICATE-----\nleaf for {}\n-----END CERTIFICATE-----\n\
+             -----BEGIN CERTIFICATE-----\nintermediate\n-----END CERTIFICATE-----\n",
+            order.names.join(",")
+        ))
     }
 }
 
 struct Harness {
     app: Router,
-    state: Arc<AppState<FakeZone>>,
+    state: Arc<AppState<FakeZone, FakeCa>>,
     zone: FakeZone,
+    ca: FakeCa,
     db: PgPool,
     _postgres: ContainerAsync<Postgres>,
 }
@@ -85,18 +167,24 @@ async fn harness(mints_per_hour: u32) -> Harness {
     let db = PgPool::connect(&url).await.unwrap();
     MIGRATOR.run(&db).await.unwrap();
     let zone = FakeZone::default();
+    let ca = FakeCa {
+        zone: zone.clone(),
+        rate_limit_next_order: Arc::default(),
+        refuse_next_finalize: Arc::default(),
+    };
     let config = Config {
         apex: APEX.into(),
         mints_per_hour,
         client_ip_header: Some("x-real-ip".parse().unwrap()),
     };
-    let state = Arc::new(AppState::new(db.clone(), zone.clone(), config));
+    let state = Arc::new(AppState::new(db.clone(), zone.clone(), ca.clone(), config));
     let app = router(Arc::clone(&state))
         .layer(MockConnectInfo(SocketAddr::from(([198, 51, 100, 1], 4000))));
     Harness {
         app,
         state,
         zone,
+        ca,
         db,
         _postgres: postgres,
     }
@@ -447,4 +535,134 @@ async fn reaper_frees_unused_reservations_and_retires_expired_leases() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert!(h.zone.values(&live, RecordType::A).is_some());
+}
+
+fn csr(names: &[&str]) -> String {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let names = names
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let mut params = rcgen::CertificateParams::new(names).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.serialize_request(&key).unwrap().pem().unwrap()
+}
+
+#[tokio::test]
+async fn certificate_is_issued_through_dns01_and_the_challenge_removed() {
+    let h = harness(100).await;
+    let (name, token) = h.mint(Some("secure")).await;
+    let wildcard = format!("*.{name}");
+
+    let body = json!({ "csr": csr(&[&name, &wildcard]) });
+    let (status, body) = h
+        .authed(Method::POST, &name, "/certificate", &token, Some(body))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let chain = body["certificate_chain_pem"].as_str().unwrap();
+    assert!(chain.contains(&format!("leaf for {name},{wildcard}")));
+    assert_eq!(chain.matches("BEGIN CERTIFICATE").count(), 2);
+
+    let challenge = format!("_acme-challenge.{name}");
+    assert_eq!(h.zone.values(&challenge, RecordType::Txt), None);
+}
+
+#[tokio::test]
+async fn certificate_refuses_csrs_outside_the_token_holders_name() {
+    let h = harness(100).await;
+    let (name, token) = h.mint(Some("scoped")).await;
+    let (other, _) = h.mint(Some("victim")).await;
+    let wildcard = format!("*.{name}");
+    let other_wildcard = format!("*.{other}");
+
+    let with_cn = {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![name.clone(), wildcard.clone()]).unwrap();
+        // rcgen's default subject CN is not one of the names.
+        params.serialize_request(&key).unwrap().pem().unwrap()
+    };
+    for pem in [
+        csr(&[&name]),
+        csr(&[&wildcard]),
+        csr(&[&name, &wildcard, &other]),
+        csr(&[&other, &other_wildcard]),
+        csr(&[&name, "*.*.scoped.ployz.test"]),
+        with_cn,
+        "not a csr".to_owned(),
+    ] {
+        let (status, body) = h
+            .authed(
+                Method::POST,
+                &name,
+                "/certificate",
+                &token,
+                Some(json!({ "csr": pem })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"], "invalid_csr");
+    }
+
+    // Only the token holder of the name may ask.
+    let (status, _) = h
+        .authed(
+            Method::POST,
+            &other,
+            "/certificate",
+            &token,
+            Some(json!({ "csr": csr(&[&other, &other_wildcard]) })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(h.zone.is_empty());
+}
+
+#[tokio::test]
+async fn certificate_honours_the_cas_retry_after() {
+    let h = harness(100).await;
+    let (name, token) = h.mint(Some("patient")).await;
+    let body = json!({ "csr": csr(&[&name, &format!("*.{name}")]) });
+    *h.ca.rate_limit_next_order.lock().unwrap() = Some(Duration::from_secs(120));
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/domains/{name}/certificate"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = h.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((100..=120).contains(&retry_after), "{retry_after}");
+
+    // The CA would accept now, but the service waits out Retry-After for every name.
+    let (status, body) = h
+        .authed(Method::POST, &name, "/certificate", &token, Some(body))
+        .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"], "ca_rate_limited");
+}
+
+#[tokio::test]
+async fn failed_issuance_still_removes_the_challenge() {
+    let h = harness(100).await;
+    let (name, token) = h.mint(Some("unlucky")).await;
+    *h.ca.refuse_next_finalize.lock().unwrap() = true;
+
+    let body = json!({ "csr": csr(&[&name, &format!("*.{name}")]) });
+    let (status, body) = h
+        .authed(Method::POST, &name, "/certificate", &token, Some(body))
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"], "ca_error");
+    assert_eq!(
+        h.zone
+            .values(&format!("_acme-challenge.{name}"), RecordType::Txt),
+        None
+    );
 }

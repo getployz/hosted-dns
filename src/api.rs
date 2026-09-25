@@ -1,9 +1,9 @@
-//! HTTP API: mint, rotate, records, lease, release, and the reaper.
+//! HTTP API: mint, rotate, records, lease, release, certificate, and the reaper.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, Path, State};
@@ -15,6 +15,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
 
+use crate::cert::{self, Ca, CaError};
 use crate::label;
 use crate::zone::{Change, RecordSet, RecordType, Zone, ZoneError};
 
@@ -39,15 +40,18 @@ pub struct Config {
 }
 
 /// Shared state for every request.
-pub struct AppState<Z> {
+pub struct AppState<Z, C> {
     db: PgPool,
     zone: Z,
+    ca: C,
     config: Config,
     mints: MintLimiter,
+    /// The CA's quota is per account, so one 429 pauses every caller.
+    ca_blocked_until: Mutex<Option<SystemTime>>,
 }
 
-impl<Z: Zone> AppState<Z> {
-    pub fn new(db: PgPool, zone: Z, config: Config) -> Self {
+impl<Z: Zone, C: Ca> AppState<Z, C> {
+    pub fn new(db: PgPool, zone: Z, ca: C, config: Config) -> Self {
         let mints = MintLimiter {
             per_hour: config.mints_per_hour,
             windows: Mutex::default(),
@@ -55,21 +59,24 @@ impl<Z: Zone> AppState<Z> {
         Self {
             db,
             zone,
+            ca,
             config,
             mints,
+            ca_blocked_until: Mutex::default(),
         }
     }
 }
 
 /// The service's routes.
-pub fn router<Z: Zone>(state: Arc<AppState<Z>>) -> Router {
+pub fn router<Z: Zone, C: Ca>(state: Arc<AppState<Z, C>>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/domains", post(mint::<Z>))
-        .route("/domains/{name}", delete(release::<Z>))
-        .route("/domains/{name}/rotate", post(rotate::<Z>))
-        .route("/domains/{name}/lease", post(renew::<Z>))
-        .route("/domains/{name}/records", put(put_records::<Z>))
+        .route("/domains", post(mint::<Z, C>))
+        .route("/domains/{name}", delete(release::<Z, C>))
+        .route("/domains/{name}/rotate", post(rotate::<Z, C>))
+        .route("/domains/{name}/lease", post(renew::<Z, C>))
+        .route("/domains/{name}/records", put(put_records::<Z, C>))
+        .route("/domains/{name}/certificate", post(certificate::<Z, C>))
         .with_state(state)
 }
 
@@ -84,8 +91,8 @@ struct MintResponse {
     token: String,
 }
 
-async fn mint<Z: Zone>(
-    State(state): State<Arc<AppState<Z>>>,
+async fn mint<Z: Zone, C: Ca>(
+    State(state): State<Arc<AppState<Z, C>>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Result<Option<Json<MintRequest>>, JsonRejection>,
@@ -122,8 +129,8 @@ struct RotateResponse {
     token: String,
 }
 
-async fn rotate<Z: Zone>(
-    State(state): State<Arc<AppState<Z>>>,
+async fn rotate<Z: Zone, C: Ca>(
+    State(state): State<Arc<AppState<Z, C>>>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<RotateResponse>, ApiError> {
@@ -145,8 +152,8 @@ struct LeaseResponse {
     lease_expires_at: DateTime<Utc>,
 }
 
-async fn renew<Z: Zone>(
-    State(state): State<Arc<AppState<Z>>>,
+async fn renew<Z: Zone, C: Ca>(
+    State(state): State<Arc<AppState<Z, C>>>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<LeaseResponse>, ApiError> {
@@ -168,8 +175,8 @@ struct Records {
     aaaa: Vec<Ipv6Addr>,
 }
 
-async fn put_records<Z: Zone>(
-    State(state): State<Arc<AppState<Z>>>,
+async fn put_records<Z: Zone, C: Ca>(
+    State(state): State<Arc<AppState<Z, C>>>,
     Path(name): Path<String>,
     headers: HeaderMap,
     body: Result<Json<Records>, JsonRejection>,
@@ -226,8 +233,8 @@ async fn put_records<Z: Zone>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn release<Z: Zone>(
-    State(state): State<Arc<AppState<Z>>>,
+async fn release<Z: Zone, C: Ca>(
+    State(state): State<Arc<AppState<Z, C>>>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
@@ -238,13 +245,59 @@ async fn release<Z: Zone>(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+struct CertificateRequest {
+    csr: String,
+}
+
+#[derive(Serialize)]
+struct CertificateResponse {
+    certificate_chain_pem: String,
+}
+
+// ponytail: no per-name lock; overlapping calls for one name clobber each other's
+// challenge and one fails. Cloud runs one sync per Organization at a time.
+async fn certificate<Z: Zone, C: Ca>(
+    State(state): State<Arc<AppState<Z, C>>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<CertificateRequest>, JsonRejection>,
+) -> Result<Json<CertificateResponse>, ApiError> {
+    let Json(request) = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    let mut tx = state.db.begin().await?;
+    authenticate(&mut tx, &name, &headers).await?;
+    // Issuance takes minutes; do not hold the row lock through it.
+    tx.commit().await?;
+    let csr_der = cert::csr_der(&request.csr, &name)?;
+
+    let blocked_until = *state
+        .ca_blocked_until
+        .lock()
+        .expect("ca backoff lock is never poisoned");
+    if let Some(until) = blocked_until
+        && until > SystemTime::now()
+    {
+        return Err(CaError::RateLimited { until }.into());
+    }
+    let issued = cert::issue(&state.zone, &state.ca, &name, &csr_der).await;
+    if let Err(ApiError::Ca(CaError::RateLimited { until })) = &issued {
+        *state
+            .ca_blocked_until
+            .lock()
+            .expect("ca backoff lock is never poisoned") = Some(*until);
+    }
+    Ok(Json(CertificateResponse {
+        certificate_chain_pem: issued?,
+    }))
+}
+
 /// Frees reservations that published no records within 24 hours, and retires
 /// names whose lease expired (removing their records).
 ///
 /// # Errors
 ///
 /// Returns [`ApiError`] on the first database or Route 53 failure; the next run retries.
-pub async fn reap<Z: Zone>(state: &AppState<Z>) -> Result<(), ApiError> {
+pub async fn reap<Z: Zone, C: Ca>(state: &AppState<Z, C>) -> Result<(), ApiError> {
     sqlx::query(
         "DELETE FROM domains
          WHERE retired_at IS NULL AND NOT has_records AND reserved_at < now() - $1",
@@ -425,6 +478,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("{0}")]
     InvalidRecords(String),
+    #[error("{0}")]
+    InvalidCsr(String),
     #[error("missing or wrong bearer token")]
     Unauthorized,
     #[error("no such domain")]
@@ -437,6 +492,8 @@ pub enum ApiError {
     NamespaceExhausted,
     #[error("dns provider: {0}")]
     Zone(#[from] ZoneError),
+    #[error("certificate authority: {0}")]
+    Ca(#[from] CaError),
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
     #[error("token hashing: {0}")]
@@ -448,15 +505,21 @@ impl IntoResponse for ApiError {
         let (status, code) = match &self {
             Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::InvalidRecords(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_records"),
+            Self::InvalidCsr(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_csr"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Self::Retired => (StatusCode::GONE, "retired"),
             Self::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Self::NamespaceExhausted => (StatusCode::SERVICE_UNAVAILABLE, "namespace_exhausted"),
             Self::Zone(_) => (StatusCode::BAD_GATEWAY, "dns_provider_error"),
+            Self::Ca(CaError::RateLimited { .. }) => {
+                (StatusCode::TOO_MANY_REQUESTS, "ca_rate_limited")
+            }
+            Self::Ca(CaError::Failed(_)) => (StatusCode::BAD_GATEWAY, "ca_error"),
             Self::Db(_) | Self::Hash(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
-        let message = if status.is_server_error() {
+        // AWS errors can carry account ids; CA problems are safe and Cloud needs the reason.
+        let message = if matches!(self, Self::Zone(_) | Self::Db(_) | Self::Hash(_)) {
             tracing::error!(error = %self, "request failed");
             "internal error".to_owned()
         } else {
@@ -464,10 +527,19 @@ impl IntoResponse for ApiError {
         };
         let body = Json(serde_json::json!({ "error": code, "message": message }));
         let mut response = (status, body).into_response();
-        if let Self::RateLimited { retry_after_secs } = self {
+        let retry_after_secs = match self {
+            Self::RateLimited { retry_after_secs } => Some(retry_after_secs),
+            Self::Ca(CaError::RateLimited { until }) => Some(
+                until
+                    .duration_since(SystemTime::now())
+                    .map_or(1, |left| left.as_secs().max(1)),
+            ),
+            _ => None,
+        };
+        if let Some(secs) = retry_after_secs {
             response
                 .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from(retry_after_secs));
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
         }
         response
     }
