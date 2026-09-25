@@ -61,8 +61,10 @@ pub enum CertError {
     /// The CSR is not PEM PKCS#10 naming exactly `name` and `*.name`.
     #[error("{0}")]
     InvalidCsr(String),
+    /// The CA refused, failed or rate-limited the order.
     #[error("certificate authority: {0}")]
     Ca(#[from] CaError),
+    /// Route 53 failed writing, syncing or removing the challenge.
     #[error("dns provider: {0}")]
     Zone(#[from] ZoneError),
 }
@@ -128,7 +130,7 @@ fn csr_der(pem: &str, name: &ClusterDomain) -> Result<Vec<u8>, CertError> {
     let (_, csr) = X509CertificationRequest::from_der(&pem.contents)
         .map_err(|_| invalid("csr is not a valid PKCS#10 request"))?;
 
-    let expected = BTreeSet::from([name.as_str().to_owned(), name.wildcard()]);
+    let expected = BTreeSet::from(name.names());
     let mut requested = BTreeSet::new();
     for extension in csr.requested_extensions().into_iter().flatten() {
         let ParsedExtension::SubjectAlternativeName(san) = extension else {
@@ -160,8 +162,7 @@ async fn order_with_dns01<Z: Zone, C: Ca>(
     name: &ClusterDomain,
     csr_der: &[u8],
 ) -> Result<String, CertError> {
-    let names = [name.as_str().to_owned(), name.wildcard()];
-    let (order, values) = ca.new_order(&names).await?;
+    let (order, values) = ca.new_order(&name.names()).await?;
     if values.is_empty() {
         return Ok(ca.finalize(order, csr_der).await?);
     }

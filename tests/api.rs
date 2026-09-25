@@ -10,8 +10,8 @@ use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use hosted_dns::{
-    AppState, Ca, CaError, Change, ChangeId, Config, MIGRATOR, RecordSet, RecordType, TOKEN_LEN,
-    Zone, ZoneError, reap, router,
+    AppState, Ca, CaError, Change, ChangeId, Config, MIGRATOR, RecordSet, RecordType, Zone,
+    ZoneError, reap, router,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -274,10 +274,16 @@ async fn mint_grants_preferred_suffixed_or_random_labels() {
 
     let (name, token) = h.mint(Some("acme")).await;
     assert_eq!(name, format!("acme.{APEX}"));
-    assert_eq!(token.len(), TOKEN_LEN);
+    assert!(
+        token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+        "{token}"
+    );
 
     // Taken and reserved labels get a 4-character suffix.
-    let (taken, _) = h.mint(Some("acme")).await;
+    let (taken, other_token) = h.mint(Some("acme")).await;
+    assert_ne!(token, other_token);
     let suffix = label_of(&taken).strip_prefix("acme-").unwrap();
     assert_eq!(suffix.len(), 4);
     let (reserved, _) = h.mint(Some("www")).await;
@@ -375,11 +381,20 @@ async fn authentication_failures_are_distinguished() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = h.authed(Method::POST, &name, "/lease", "wrong", None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, body) = h
-        .authed(Method::POST, "nope.ployz.test", "/lease", "wrong", None)
-        .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"], "not_found");
+    // Unknown names and names that could never be granted look the same.
+    for unknown in [
+        "nope.ployz.test",
+        "evil.example.com",
+        "a.b.ployz.test",
+        "-x.ployz.test",
+        "ployz.test",
+    ] {
+        let (status, body) = h
+            .authed(Method::POST, unknown, "/lease", "wrong", None)
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{unknown}");
+        assert_eq!(body["error"], "not_found");
+    }
 }
 
 #[tokio::test]

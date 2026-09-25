@@ -2,7 +2,7 @@
 
 use bcrypt::BcryptError;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Labels that are never granted verbatim; they get a suffix instead.
 const RESERVED: &[&str] = &[
@@ -30,7 +30,7 @@ const RESERVED: &[&str] = &[
 
 const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
 /// Length of a bearer token: 40 characters of `[a-z0-9]`, about 206 random bits.
-pub const TOKEN_LEN: usize = 40;
+const TOKEN_LEN: usize = 40;
 // Tokens are 200+ random bits, so bcrypt's work factor guards nothing brute force could reach.
 const BCRYPT_COST: u32 = 10;
 const SUFFIX_LEN: usize = 4;
@@ -71,7 +71,7 @@ fn random_string(len: usize) -> String {
 }
 
 /// A granted Cluster Domain, e.g. `acme.ployz.app`: one label under the apex.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, sqlx::Type)]
 #[serde(transparent)]
 #[sqlx(transparent)]
 pub(crate) struct ClusterDomain(String);
@@ -81,6 +81,20 @@ impl ClusterDomain {
         Self(format!("{label}.{apex}"))
     }
 
+    /// Accepts exactly one DNS label under `apex`. `None` for anything else,
+    /// which callers treat like an unknown name.
+    // The apex is runtime config, so this is a function rather than FromStr/serde.
+    pub(crate) fn parse(name: &str, apex: &str) -> Option<Self> {
+        let label = name.strip_suffix(apex)?.strip_suffix('.')?;
+        let valid = (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-');
+        valid.then(|| Self(name.to_owned()))
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -88,6 +102,11 @@ impl ClusterDomain {
     /// `*.name`, the CNAME to the apex and the certificate's second name.
     pub(crate) fn wildcard(&self) -> String {
         format!("*.{}", self.0)
+    }
+
+    /// `[name, *.name]`: the records' owners and the certificate's names.
+    pub(crate) fn names(&self) -> [String; 2] {
+        [self.0.clone(), self.wildcard()]
     }
 
     /// `_acme-challenge.name`, where DNS-01 validates both `name` and `*.name`.

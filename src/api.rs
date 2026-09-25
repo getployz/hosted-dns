@@ -47,6 +47,13 @@ pub struct AppState<Z, C> {
     mints: MintLimiter,
 }
 
+impl<Z, C> AppState<Z, C> {
+    /// A path name that is not a label under the apex can not exist.
+    fn domain(&self, name: &str) -> Result<ClusterDomain, ApiError> {
+        ClusterDomain::parse(name, &self.config.apex).ok_or(ApiError::NotFound)
+    }
+}
+
 impl<Z: Zone, C: Ca> AppState<Z, C> {
     /// Wires the database, the DNS zone, the certificate authority and settings.
     pub fn new(db: PgPool, zone: Z, ca: C, config: Config) -> Self {
@@ -143,9 +150,10 @@ struct RotateResponse {
 
 async fn rotate<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<ClusterDomain>,
+    Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<RotateResponse>, ApiError> {
+    let name = state.domain(&name)?;
     let mut tx = state.db.begin().await?;
     authorize_and_renew(&mut tx, &name, &headers).await?;
     let token = Token::generate();
@@ -166,9 +174,10 @@ struct LeaseResponse {
 
 async fn renew<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<ClusterDomain>,
+    Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<LeaseResponse>, ApiError> {
+    let name = state.domain(&name)?;
     let mut tx = state.db.begin().await?;
     let lease_expires_at = authorize_and_renew(&mut tx, &name, &headers).await?;
     tx.commit().await?;
@@ -190,10 +199,11 @@ struct ApexAddresses {
 
 async fn put_records<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<ClusterDomain>,
+    Path(name): Path<String>,
     headers: HeaderMap,
     body: Result<Json<ApexAddresses>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let name = state.domain(&name)?;
     let Json(addresses) = body?;
     let mut tx = state.db.begin().await?;
     authorize_and_renew(&mut tx, &name, &headers).await?;
@@ -243,9 +253,10 @@ async fn put_records<Z: Zone, C: Ca>(
 
 async fn release<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<ClusterDomain>,
+    Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
+    let name = state.domain(&name)?;
     let mut tx = state.db.begin().await?;
     authorize_and_renew(&mut tx, &name, &headers).await?;
     retire(&state.zone, &mut tx, &name).await?;
@@ -267,10 +278,11 @@ struct CertificateResponse {
 // challenge and one fails. Cloud runs one sync per Organization at a time.
 async fn certificate<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<ClusterDomain>,
+    Path(name): Path<String>,
     headers: HeaderMap,
     body: Result<Json<CertificateRequest>, JsonRejection>,
 ) -> Result<Json<CertificateResponse>, ApiError> {
+    let name = state.domain(&name)?;
     let Json(request) = body?;
     let mut tx = state.db.begin().await?;
     authorize_and_renew(&mut tx, &name, &headers).await?;
@@ -332,7 +344,7 @@ async fn retire<Z: Zone>(
     name: &ClusterDomain,
 ) -> Result<(), ApiError> {
     let mut changes = Vec::new();
-    for set_name in [name.as_str().to_owned(), name.wildcard()] {
+    for set_name in name.names() {
         changes.extend(
             zone.record_sets(&set_name)
                 .await?
@@ -504,9 +516,12 @@ pub enum ApiError {
     /// Every label attempt collided: 503.
     #[error("no free label found, try again")]
     NamespaceExhausted,
-    /// Certificate request failed: 422, 429 or 502.
-    #[error(transparent)]
-    Cert(#[from] CertError),
+    /// CSR is not PEM PKCS#10 naming exactly `name` and `*.name`: 422.
+    #[error("{0}")]
+    InvalidCsr(String),
+    /// CA rate limit (429 with `Retry-After`) or failure (502).
+    #[error("certificate authority: {0}")]
+    Ca(CaError),
     /// Route 53 failed: 502.
     #[error("dns provider: {0}")]
     Zone(#[from] ZoneError),
@@ -516,6 +531,16 @@ pub enum ApiError {
     /// Token hashing failed: 500.
     #[error("token hashing: {0}")]
     Hash(#[from] bcrypt::BcryptError),
+}
+
+impl From<CertError> for ApiError {
+    fn from(error: CertError) -> Self {
+        match error {
+            CertError::InvalidCsr(why) => Self::InvalidCsr(why),
+            CertError::Ca(error) => Self::Ca(error),
+            CertError::Zone(error) => Self::Zone(error),
+        }
+    }
 }
 
 impl From<JsonRejection> for ApiError {
@@ -557,21 +582,15 @@ impl IntoResponse for ApiError {
                 None,
                 true,
             ),
-            Self::Cert(CertError::InvalidCsr(_)) => {
-                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_csr", None, true)
-            }
-            Self::Cert(CertError::Ca(CaError::RateLimited { until })) => (
+            Self::InvalidCsr(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_csr", None, true),
+            Self::Ca(CaError::RateLimited { until }) => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "ca_rate_limited",
                 Some(seconds_until(until)),
                 true,
             ),
-            Self::Cert(CertError::Ca(CaError::Failed(_))) => {
-                (StatusCode::BAD_GATEWAY, "ca_error", None, true)
-            }
-            Self::Cert(CertError::Zone(_)) | Self::Zone(_) => {
-                (StatusCode::BAD_GATEWAY, "dns_provider_error", None, false)
-            }
+            Self::Ca(CaError::Failed(_)) => (StatusCode::BAD_GATEWAY, "ca_error", None, true),
+            Self::Zone(_) => (StatusCode::BAD_GATEWAY, "dns_provider_error", None, false),
             Self::Db(_) | Self::Hash(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal", None, false)
             }

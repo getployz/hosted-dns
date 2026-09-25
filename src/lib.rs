@@ -12,7 +12,6 @@ mod zone;
 pub use acme::{Acme, AcmeConfig};
 pub use api::{ApiError, AppState, Config, reap, router};
 pub use cert::{Ca, CaError, CertError};
-pub use domain::TOKEN_LEN;
 pub use route53::Route53;
 pub use zone::{Change, ChangeId, RecordSet, RecordType, Zone, ZoneError};
 
