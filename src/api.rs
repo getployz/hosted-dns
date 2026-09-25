@@ -15,15 +15,12 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
 
-use crate::cert::{self, Ca, CaError};
-use crate::label;
+use crate::cert::{Ca, CaError, CertError, Issuer};
+use crate::domain::{self, ClusterDomain, Token};
 use crate::zone::{Change, RecordSet, RecordType, Zone, ZoneError};
 
 const LEASE: TimeDelta = TimeDelta::days(7);
 const UNUSED_RESERVATION: TimeDelta = TimeDelta::hours(24);
-const TOKEN_LEN: usize = 40;
-// Tokens are 200+ random bits, so bcrypt's work factor guards nothing brute force could reach.
-const BCRYPT_COST: u32 = 10;
 const MINT_ATTEMPTS: usize = 8;
 const RECORD_TTL: i64 = 60;
 const MAX_ADDRESSES: usize = 32;
@@ -45,14 +42,13 @@ pub struct Config {
 pub struct AppState<Z, C> {
     db: PgPool,
     zone: Z,
-    ca: C,
+    issuer: Issuer<C>,
     config: Config,
     mints: MintLimiter,
-    /// The CA's quota is per account, so one 429 pauses every caller.
-    ca_blocked_until: Mutex<Option<SystemTime>>,
 }
 
 impl<Z: Zone, C: Ca> AppState<Z, C> {
+    /// Wires the database, the DNS zone, the certificate authority and settings.
     pub fn new(db: PgPool, zone: Z, ca: C, config: Config) -> Self {
         let mints = MintLimiter {
             per_hour: config.mints_per_hour,
@@ -61,15 +57,14 @@ impl<Z: Zone, C: Ca> AppState<Z, C> {
         Self {
             db,
             zone,
-            ca,
+            issuer: Issuer::new(ca),
             config,
             mints,
-            ca_blocked_until: Mutex::default(),
         }
     }
 }
 
-/// The service's routes.
+/// The service's routes, including `GET /healthz` for the platform's probe.
 pub fn router<Z: Zone, C: Ca>(state: Arc<AppState<Z, C>>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -89,8 +84,8 @@ struct MintRequest {
 
 #[derive(Serialize)]
 struct MintResponse {
-    name: String,
-    token: String,
+    name: ClusterDomain,
+    token: Token,
 }
 
 async fn mint<Z: Zone, C: Ca>(
@@ -99,7 +94,7 @@ async fn mint<Z: Zone, C: Ca>(
     headers: HeaderMap,
     body: Result<Option<Json<MintRequest>>, JsonRejection>,
 ) -> Result<(StatusCode, Json<MintResponse>), ApiError> {
-    let body = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    let body = body?;
     if headers.contains_key(header::AUTHORIZATION) {
         // A caller that presents a key never falls back to anonymous minting.
         let key = bearer(&headers).ok_or(ApiError::Unauthorized)?;
@@ -118,10 +113,10 @@ async fn mint<Z: Zone, C: Ca>(
         state.mints.check(client)?;
     }
     let preferred = body.and_then(|Json(body)| body.preferred);
-    let token = label::random_string(TOKEN_LEN);
-    let token_hash = hash(&token).await?;
-    for label in label::candidates(preferred.as_deref()).take(MINT_ATTEMPTS) {
-        let name = format!("{label}.{}", state.config.apex);
+    let token = Token::generate();
+    let token_hash = token.hash().await?;
+    for label in domain::candidates(preferred.as_deref()).take(MINT_ATTEMPTS) {
+        let name = ClusterDomain::new(&label, &state.config.apex);
         // Retired names keep their row, so the conflict also refuses them.
         let inserted = sqlx::query(
             "INSERT INTO domains (name, token_hash, lease_expires_at) VALUES ($1, $2, now() + $3)
@@ -143,20 +138,20 @@ async fn mint<Z: Zone, C: Ca>(
 
 #[derive(Serialize)]
 struct RotateResponse {
-    token: String,
+    token: Token,
 }
 
 async fn rotate<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<String>,
+    Path(name): Path<ClusterDomain>,
     headers: HeaderMap,
 ) -> Result<Json<RotateResponse>, ApiError> {
     let mut tx = state.db.begin().await?;
-    authenticate(&mut tx, &name, &headers).await?;
-    let token = label::random_string(TOKEN_LEN);
+    authorize_and_renew(&mut tx, &name, &headers).await?;
+    let token = Token::generate();
     sqlx::query("UPDATE domains SET token_hash = $2 WHERE name = $1")
         .bind(&name)
-        .bind(hash(&token).await?)
+        .bind(token.hash().await?)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -165,17 +160,17 @@ async fn rotate<Z: Zone, C: Ca>(
 
 #[derive(Serialize)]
 struct LeaseResponse {
-    name: String,
+    name: ClusterDomain,
     lease_expires_at: DateTime<Utc>,
 }
 
 async fn renew<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<String>,
+    Path(name): Path<ClusterDomain>,
     headers: HeaderMap,
 ) -> Result<Json<LeaseResponse>, ApiError> {
     let mut tx = state.db.begin().await?;
-    let lease_expires_at = authenticate(&mut tx, &name, &headers).await?;
+    let lease_expires_at = authorize_and_renew(&mut tx, &name, &headers).await?;
     tx.commit().await?;
     Ok(Json(LeaseResponse {
         name,
@@ -183,9 +178,10 @@ async fn renew<Z: Zone, C: Ca>(
     }))
 }
 
+/// The full apex address set; an omitted family is removed.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Records {
+struct ApexAddresses {
     #[serde(default)]
     a: Vec<Ipv4Addr>,
     #[serde(default)]
@@ -194,69 +190,64 @@ struct Records {
 
 async fn put_records<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<String>,
+    Path(name): Path<ClusterDomain>,
     headers: HeaderMap,
-    body: Result<Json<Records>, JsonRejection>,
+    body: Result<Json<ApexAddresses>, JsonRejection>,
 ) -> Result<StatusCode, ApiError> {
-    let Json(records) = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    let Json(addresses) = body?;
     let mut tx = state.db.begin().await?;
-    authenticate(&mut tx, &name, &headers).await?;
-    let wanted = [
-        (RecordType::A, addresses(records.a, |ip| is_public_v4(*ip))?),
-        (RecordType::Aaaa, addresses(records.aaaa, is_public_v6)?),
+    authorize_and_renew(&mut tx, &name, &headers).await?;
+    let desired_apex = [
+        (
+            RecordType::A,
+            public_addresses(addresses.a, |ip| is_public_v4(*ip))?,
+        ),
+        (
+            RecordType::Aaaa,
+            public_addresses(addresses.aaaa, is_public_v6)?,
+        ),
     ];
-    if wanted.iter().all(|(_, values)| values.is_empty()) {
+    if desired_apex.iter().all(|(_, values)| values.is_empty()) {
         return Err(ApiError::InvalidRecords(
             "at least one address is required".into(),
         ));
     }
 
-    let current = state.zone.record_sets(&name).await?;
+    let current_apex = state.zone.record_sets(name.as_str()).await?;
     let mut changes = Vec::new();
-    for (kind, values) in wanted {
+    for (kind, values) in desired_apex {
         if !values.is_empty() {
             changes.push(Change::Upsert(RecordSet {
-                name: name.clone(),
+                name: name.as_str().to_owned(),
                 kind,
                 ttl: RECORD_TTL,
                 values,
             }));
-        } else if let Some(stale) = current.iter().find(|set| set.kind == kind) {
+        } else if let Some(stale) = current_apex.iter().find(|set| set.kind == kind) {
             changes.push(Change::Delete(stale.clone()));
         }
     }
-    let wildcard = format!("*.{name}");
-    let has_wildcard = state
-        .zone
-        .record_sets(&wildcard)
-        .await?
-        .iter()
-        .any(|set| set.kind == RecordType::Cname);
-    if !has_wildcard {
-        changes.push(Change::Upsert(RecordSet {
-            values: vec![name.clone()],
-            name: wildcard,
-            kind: RecordType::Cname,
-            ttl: RECORD_TTL,
-        }));
-    }
+    // Upserting an unchanged CNAME is a no-op, so no read is needed to write it "once".
+    changes.push(Change::Upsert(RecordSet {
+        name: name.wildcard(),
+        kind: RecordType::Cname,
+        ttl: RECORD_TTL,
+        values: vec![name.as_str().to_owned()],
+    }));
     state.zone.apply(changes).await?;
 
-    sqlx::query("UPDATE domains SET has_records = true WHERE name = $1")
-        .bind(&name)
-        .execute(&mut *tx)
-        .await?;
+    mark_used(&mut tx, &name).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn release<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<String>,
+    Path(name): Path<ClusterDomain>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let mut tx = state.db.begin().await?;
-    authenticate(&mut tx, &name, &headers).await?;
+    authorize_and_renew(&mut tx, &name, &headers).await?;
     retire(&state.zone, &mut tx, &name).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
@@ -276,40 +267,25 @@ struct CertificateResponse {
 // challenge and one fails. Cloud runs one sync per Organization at a time.
 async fn certificate<Z: Zone, C: Ca>(
     State(state): State<Arc<AppState<Z, C>>>,
-    Path(name): Path<String>,
+    Path(name): Path<ClusterDomain>,
     headers: HeaderMap,
     body: Result<Json<CertificateRequest>, JsonRejection>,
 ) -> Result<Json<CertificateResponse>, ApiError> {
-    let Json(request) = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
+    let Json(request) = body?;
     let mut tx = state.db.begin().await?;
-    authenticate(&mut tx, &name, &headers).await?;
+    authorize_and_renew(&mut tx, &name, &headers).await?;
+    // A certificate may exist from here on, so the reaper must never free this name.
+    mark_used(&mut tx, &name).await?;
     // Issuance takes minutes; do not hold the row lock through it.
     tx.commit().await?;
-    let csr_der = cert::csr_der(&request.csr, &name)?;
-
-    let blocked_until = *state
-        .ca_blocked_until
-        .lock()
-        .expect("ca backoff lock is never poisoned");
-    if let Some(until) = blocked_until
-        && until > SystemTime::now()
-    {
-        return Err(CaError::RateLimited { until }.into());
-    }
-    let issued = cert::issue(&state.zone, &state.ca, &name, &csr_der).await;
-    if let Err(ApiError::Ca(CaError::RateLimited { until })) = &issued {
-        *state
-            .ca_blocked_until
-            .lock()
-            .expect("ca backoff lock is never poisoned") = Some(*until);
-    }
+    let certificate_chain_pem = state.issuer.issue(&state.zone, &name, &request.csr).await?;
     Ok(Json(CertificateResponse {
-        certificate_chain_pem: issued?,
+        certificate_chain_pem,
     }))
 }
 
-/// Frees reservations that published no records within 24 hours, and retires
-/// names whose lease expired (removing their records).
+/// Frees reservations that never published records or asked for a certificate
+/// within 24 hours, and retires names whose lease expired (removing their records).
 ///
 /// # Errors
 ///
@@ -317,7 +293,7 @@ async fn certificate<Z: Zone, C: Ca>(
 pub async fn reap<Z: Zone, C: Ca>(state: &AppState<Z, C>) -> Result<(), ApiError> {
     sqlx::query(
         "DELETE FROM domains
-         WHERE retired_at IS NULL AND NOT has_records AND reserved_at < now() - $1",
+         WHERE retired_at IS NULL AND NOT used AND reserved_at < now() - $1",
     )
     .bind(UNUSED_RESERVATION)
     .execute(&state.db)
@@ -325,7 +301,7 @@ pub async fn reap<Z: Zone, C: Ca>(state: &AppState<Z, C>) -> Result<(), ApiError
     // ponytail: one name per transaction; a name Route 53 keeps refusing stalls the rest until fixed.
     loop {
         let mut tx = state.db.begin().await?;
-        let Some(name) = sqlx::query_scalar::<_, String>(
+        let Some(name) = sqlx::query_scalar::<_, ClusterDomain>(
             "SELECT name FROM domains WHERE retired_at IS NULL AND lease_expires_at < now()
              LIMIT 1 FOR UPDATE SKIP LOCKED",
         )
@@ -340,10 +316,23 @@ pub async fn reap<Z: Zone, C: Ca>(state: &AppState<Z, C>) -> Result<(), ApiError
     }
 }
 
+/// Once records or a certificate exist, only the lease decides the name's fate.
+async fn mark_used(tx: &mut PgConnection, name: &ClusterDomain) -> Result<(), ApiError> {
+    sqlx::query("UPDATE domains SET used = true WHERE name = $1")
+        .bind(name)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
 /// Removes the apex and wildcard records and marks the name retired forever.
-async fn retire<Z: Zone>(zone: &Z, tx: &mut PgConnection, name: &str) -> Result<(), ApiError> {
+async fn retire<Z: Zone>(
+    zone: &Z,
+    tx: &mut PgConnection,
+    name: &ClusterDomain,
+) -> Result<(), ApiError> {
     let mut changes = Vec::new();
-    for set_name in [name.to_owned(), format!("*.{name}")] {
+    for set_name in [name.as_str().to_owned(), name.wildcard()] {
         changes.extend(
             zone.record_sets(&set_name)
                 .await?
@@ -361,14 +350,15 @@ async fn retire<Z: Zone>(zone: &Z, tx: &mut PgConnection, name: &str) -> Result<
     Ok(())
 }
 
-/// Locks the name's row for the transaction, checks the bearer token and renews
-/// the lease. Returns the new lease expiry.
-async fn authenticate(
+/// Locks the name's row for the transaction, checks the bearer token, and
+/// renews the lease: every authorized call keeps the name alive. Returns the
+/// new lease expiry.
+async fn authorize_and_renew(
     tx: &mut PgConnection,
-    name: &str,
+    name: &ClusterDomain,
     headers: &HeaderMap,
 ) -> Result<DateTime<Utc>, ApiError> {
-    let token = bearer(headers).ok_or(ApiError::Unauthorized)?.to_owned();
+    let token = Token::from_bearer(bearer(headers).ok_or(ApiError::Unauthorized)?);
     let row: Option<(String, Option<DateTime<Utc>>)> =
         sqlx::query_as("SELECT token_hash, retired_at FROM domains WHERE name = $1 FOR UPDATE")
             .bind(name)
@@ -380,10 +370,7 @@ async fn authenticate(
     if retired_at.is_some() {
         return Err(ApiError::Retired);
     }
-    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(token, &token_hash))
-        .await
-        .expect("bcrypt verify does not panic")?;
-    if !valid {
+    if !token.verify(token_hash).await? {
         return Err(ApiError::Unauthorized);
     }
     let lease_expires_at = sqlx::query_scalar(
@@ -415,17 +402,9 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
             == 0
 }
 
-async fn hash(token: &str) -> Result<String, ApiError> {
-    let token = token.to_owned();
-    Ok(
-        tokio::task::spawn_blocking(move || bcrypt::hash(token, BCRYPT_COST))
-            .await
-            .expect("bcrypt hash does not panic")?,
-    )
-}
-
-/// Sorts and dedups `addresses`, refusing non-public ones and oversized sets.
-fn addresses<T: Ord + ToString>(
+/// Sorts and dedups `addresses` into record values, refusing non-public
+/// addresses and sets larger than [`MAX_ADDRESSES`].
+fn public_addresses<T: Ord + ToString>(
     mut addresses: Vec<T>,
     is_public: impl Fn(&T) -> bool,
 ) -> Result<Vec<String>, ApiError> {
@@ -504,68 +483,107 @@ impl MintLimiter {
 /// Every failure the API returns, rendered as `{"error": code, "message": text}`.
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
+    /// Malformed JSON, bad address syntax, or unknown fields: 400.
     #[error("{0}")]
     BadRequest(String),
+    /// Empty, non-public or oversized address set: 422.
     #[error("{0}")]
     InvalidRecords(String),
-    #[error("{0}")]
-    InvalidCsr(String),
+    /// Missing or wrong bearer token or mint key: 401.
     #[error("missing or wrong bearer token")]
     Unauthorized,
+    /// Never minted, or reaped: 404.
     #[error("no such domain")]
     NotFound,
+    /// Released or lease expired: 410.
     #[error("domain was released and is retired")]
     Retired,
+    /// Anonymous mint limit hit: 429 with `Retry-After`.
     #[error("too many domains minted from this address")]
     RateLimited { retry_after_secs: u64 },
+    /// Every label attempt collided: 503.
     #[error("no free label found, try again")]
     NamespaceExhausted,
+    /// Certificate request failed: 422, 429 or 502.
+    #[error(transparent)]
+    Cert(#[from] CertError),
+    /// Route 53 failed: 502.
     #[error("dns provider: {0}")]
     Zone(#[from] ZoneError),
-    #[error("certificate authority: {0}")]
-    Ca(#[from] CaError),
+    /// Postgres failed: 500.
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
+    /// Token hashing failed: 500.
     #[error("token hashing: {0}")]
     Hash(#[from] bcrypt::BcryptError),
 }
 
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::BadRequest(rejection.body_text())
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, code) = match &self {
-            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
-            Self::InvalidRecords(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_records"),
-            Self::InvalidCsr(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_csr"),
-            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-            Self::Retired => (StatusCode::GONE, "retired"),
-            Self::RateLimited { .. } => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-            Self::NamespaceExhausted => (StatusCode::SERVICE_UNAVAILABLE, "namespace_exhausted"),
-            Self::Zone(_) => (StatusCode::BAD_GATEWAY, "dns_provider_error"),
-            Self::Ca(CaError::RateLimited { .. }) => {
-                (StatusCode::TOO_MANY_REQUESTS, "ca_rate_limited")
-            }
-            Self::Ca(CaError::Failed(_)) => (StatusCode::BAD_GATEWAY, "ca_error"),
-            Self::Db(_) | Self::Hash(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        let seconds_until = |until: &SystemTime| {
+            until
+                .duration_since(SystemTime::now())
+                .map_or(1, |left| left.as_secs().max(1))
         };
-        // AWS errors can carry account ids; CA problems are safe and Cloud needs the reason.
-        let message = if matches!(self, Self::Zone(_) | Self::Db(_) | Self::Hash(_)) {
+        // AWS errors can carry account ids, so upstream DNS and internal
+        // failures are logged, not returned. CA problems are safe and Cloud
+        // needs the reason.
+        let (status, code, retry_after_secs, public) = match &self {
+            Self::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request", None, true),
+            Self::InvalidRecords(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_records",
+                None,
+                true,
+            ),
+            Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized", None, true),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not_found", None, true),
+            Self::Retired => (StatusCode::GONE, "retired", None, true),
+            Self::RateLimited { retry_after_secs } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                Some(*retry_after_secs),
+                true,
+            ),
+            Self::NamespaceExhausted => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "namespace_exhausted",
+                None,
+                true,
+            ),
+            Self::Cert(CertError::InvalidCsr(_)) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "invalid_csr", None, true)
+            }
+            Self::Cert(CertError::Ca(CaError::RateLimited { until })) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "ca_rate_limited",
+                Some(seconds_until(until)),
+                true,
+            ),
+            Self::Cert(CertError::Ca(CaError::Failed(_))) => {
+                (StatusCode::BAD_GATEWAY, "ca_error", None, true)
+            }
+            Self::Cert(CertError::Zone(_)) | Self::Zone(_) => {
+                (StatusCode::BAD_GATEWAY, "dns_provider_error", None, false)
+            }
+            Self::Db(_) | Self::Hash(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "internal", None, false)
+            }
+        };
+        let message = if public {
+            self.to_string()
+        } else {
             tracing::error!(error = %self, "request failed");
             "internal error".to_owned()
-        } else {
-            self.to_string()
         };
         let body = Json(serde_json::json!({ "error": code, "message": message }));
         let mut response = (status, body).into_response();
-        let retry_after_secs = match self {
-            Self::RateLimited { retry_after_secs } => Some(retry_after_secs),
-            Self::Ca(CaError::RateLimited { until }) => Some(
-                until
-                    .duration_since(SystemTime::now())
-                    .map_or(1, |left| left.as_secs().max(1)),
-            ),
-            _ => None,
-        };
         if let Some(secs) = retry_after_secs {
             response
                 .headers_mut()

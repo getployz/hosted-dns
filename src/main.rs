@@ -7,7 +7,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hosted_dns::{Acme, AcmeConfig, AppState, Config, MIGRATOR, Route53, reap, router};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
 const REAP_EVERY: Duration = Duration::from_secs(300);
@@ -22,10 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&required("DATABASE_URL")?)
-        .await?;
+    let db = PgPool::connect(&required("DATABASE_URL")?).await?;
     MIGRATOR.run(&db).await?;
     let aws = aws_config::load_from_env().await;
     let zone = Route53::new(&aws, required("HOSTED_ZONE_ID")?);

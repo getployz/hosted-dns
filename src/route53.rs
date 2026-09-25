@@ -43,13 +43,10 @@ impl Zone for Route53 {
             .iter()
             .filter(|set| normalize(set.name()) == name)
             .filter_map(|set| {
-                let kind = match set.r#type() {
-                    r53::RrType::A => RecordType::A,
-                    r53::RrType::Aaaa => RecordType::Aaaa,
-                    r53::RrType::Cname => RecordType::Cname,
-                    r53::RrType::Txt => RecordType::Txt,
-                    _ => return None,
-                };
+                // TXT is write-only here: challenges are deleted with the values we wrote.
+                let kind = [RecordType::A, RecordType::Aaaa, RecordType::Cname]
+                    .into_iter()
+                    .find(|kind| rr_type(*kind) == *set.r#type())?;
                 Some(RecordSet {
                     name: name.to_owned(),
                     kind,
@@ -57,10 +54,7 @@ impl Zone for Route53 {
                     values: set
                         .resource_records()
                         .iter()
-                        .map(|record| match kind {
-                            RecordType::Txt => record.value().trim_matches('"').to_owned(),
-                            _ => record.value().to_owned(),
-                        })
+                        .map(|record| record.value().to_owned())
                         .collect(),
                 })
             })
@@ -131,15 +125,9 @@ fn to_r53(change: Change) -> Result<r53::Change, aws_sdk_route53::error::BuildEr
         })
         .map(|value| r53::ResourceRecord::builder().value(value).build())
         .collect::<Result<Vec<_>, _>>()?;
-    let kind = match set.kind {
-        RecordType::A => r53::RrType::A,
-        RecordType::Aaaa => r53::RrType::Aaaa,
-        RecordType::Cname => r53::RrType::Cname,
-        RecordType::Txt => r53::RrType::Txt,
-    };
     let set = r53::ResourceRecordSet::builder()
+        .r#type(rr_type(set.kind))
         .name(set.name)
-        .r#type(kind)
         .ttl(set.ttl)
         .set_resource_records(Some(records))
         .build()?;
@@ -147,6 +135,15 @@ fn to_r53(change: Change) -> Result<r53::Change, aws_sdk_route53::error::BuildEr
         .action(action)
         .resource_record_set(set)
         .build()
+}
+
+fn rr_type(kind: RecordType) -> r53::RrType {
+    match kind {
+        RecordType::A => r53::RrType::A,
+        RecordType::Aaaa => r53::RrType::Aaaa,
+        RecordType::Cname => r53::RrType::Cname,
+        RecordType::Txt => r53::RrType::Txt,
+    }
 }
 
 /// Route 53 returns `\052.acme.ployz.app.` for `*.acme.ployz.app`.

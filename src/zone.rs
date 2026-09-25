@@ -3,10 +3,13 @@
 /// Record types the service manages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordType {
+    /// Apex IPv4 addresses.
     A,
+    /// Apex IPv6 addresses.
     Aaaa,
+    /// `*.name` pointing at the apex.
     Cname,
-    /// Unquoted values; the provider adds and strips the quotes.
+    /// DNS-01 challenge values, unquoted; the provider adds the quotes.
     Txt,
 }
 
@@ -15,15 +18,20 @@ pub enum RecordType {
 pub struct RecordSet {
     /// Fully qualified name without the trailing dot, e.g. `*.acme.ployz.app`.
     pub name: String,
+    /// The record type.
     pub kind: RecordType,
+    /// Time to live in seconds.
     pub ttl: i64,
+    /// Record values, e.g. addresses or the CNAME target.
     pub values: Vec<String>,
 }
 
 /// A change with Route 53 semantics: `Delete` must match the existing set exactly.
 #[derive(Clone, Debug)]
 pub enum Change {
+    /// Create or replace the set.
     Upsert(RecordSet),
+    /// Remove the set; it must match what the zone holds.
     Delete(RecordSet),
 }
 

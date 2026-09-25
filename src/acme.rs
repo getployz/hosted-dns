@@ -9,9 +9,9 @@ use bytes::Bytes;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use instant_acme::{
-    Account, AccountCredentials, AuthorizationStatus, BodyWrapper, BytesResponse, ChallengeType,
-    ExternalAccountKey, HttpClient, Identifier, NewAccount, NewOrder, Order, OrderStatus,
-    RetryPolicy,
+    Account, AccountCredentials, AuthorizationHandle, AuthorizationStatus, BodyWrapper,
+    BytesResponse, ChallengeHandle, ChallengeType, ExternalAccountKey, HttpClient, Identifier,
+    NewAccount, NewOrder, Order, OrderStatus, RetryPolicy,
 };
 use sqlx::PgPool;
 use tokio::sync::OnceCell;
@@ -19,7 +19,7 @@ use tokio::sync::OnceCell;
 use crate::cert::{Ca, CaError};
 
 /// Order validation and certificate download get this long.
-const POLL: RetryPolicy = RetryPolicy::new()
+const ORDER_POLL_POLICY: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(2))
     .backoff(1.5)
     .timeout(Duration::from_secs(300));
@@ -28,7 +28,9 @@ const DEFAULT_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Where the ACME account lives and how to create it.
 pub struct AcmeConfig {
+    /// ACME directory, e.g. Google Trust Services production or staging.
     pub directory_url: String,
+    /// External Account Binding key id.
     pub eab_kid: String,
     /// Raw HMAC key bytes (the CA hands them out base64url-encoded).
     pub eab_hmac: Vec<u8>,
@@ -65,10 +67,10 @@ impl Acme {
                 .bind(url)
                 .fetch_optional(&self.db)
                 .await
-                .map_err(failed)?;
+                .map_err(ca_failure)?;
                 if let Some(stored) = stored {
                     let credentials: AccountCredentials =
-                        serde_json::from_str(&stored).map_err(failed)?;
+                        serde_json::from_str(&stored).map_err(ca_failure)?;
                     return builder
                         .from_credentials(credentials)
                         .await
@@ -89,10 +91,10 @@ impl Acme {
                     "INSERT INTO acme_accounts (directory_url, credentials) VALUES ($1, $2)",
                 )
                 .bind(url)
-                .bind(serde_json::to_string(&credentials).map_err(failed)?)
+                .bind(serde_json::to_string(&credentials).map_err(ca_failure)?)
                 .execute(&self.db)
                 .await
-                .map_err(failed)?;
+                .map_err(ca_failure)?;
                 tracing::info!(id = account.id(), "created ACME account");
                 Ok(account)
             })
@@ -102,7 +104,7 @@ impl Acme {
     fn http(&self) -> Result<RetryAfterRecorder, CaError> {
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .try_with_platform_verifier()
-            .map_err(failed)?
+            .map_err(ca_failure)?
             .https_only()
             .enable_http1()
             .enable_http2()
@@ -147,9 +149,7 @@ impl Ca for Acme {
             match authorization.status {
                 AuthorizationStatus::Valid => {}
                 AuthorizationStatus::Pending => {
-                    let challenge = authorization
-                        .challenge(ChallengeType::Dns01)
-                        .ok_or_else(|| CaError::Failed("CA offered no dns-01 challenge".into()))?;
+                    let challenge = dns01(&mut authorization)?;
                     values.push(challenge.key_authorization().dns_value());
                 }
                 status => return Err(CaError::Failed(format!("authorization is {status:?}"))),
@@ -165,16 +165,14 @@ impl Ca for Acme {
             if authorization.status != AuthorizationStatus::Pending {
                 continue;
             }
-            let mut challenge = authorization
-                .challenge(ChallengeType::Dns01)
-                .ok_or_else(|| CaError::Failed("CA offered no dns-01 challenge".into()))?;
+            let mut challenge = dns01(&mut authorization)?;
             challenge
                 .set_ready()
                 .await
                 .map_err(|error| self.ca_error(error))?;
         }
         let status = order
-            .poll_ready(&POLL)
+            .poll_ready(&ORDER_POLL_POLICY)
             .await
             .map_err(|error| self.ca_error(error))?;
         if status != OrderStatus::Ready {
@@ -187,7 +185,7 @@ impl Ca for Acme {
             .await
             .map_err(|error| self.ca_error(error))?;
         order
-            .poll_certificate(&POLL)
+            .poll_certificate(&ORDER_POLL_POLICY)
             .await
             .map_err(|error| self.ca_error(error))
     }
@@ -199,6 +197,8 @@ type HttpsClient = HyperClient<
 >;
 
 /// instant-acme drops `Retry-After` from 429 problems, so record it on the way through.
+// ponytail: one slot for all requests; two 429s racing may pair a problem with the
+// other's Retry-After. Both come from the same account quota, so either is close.
 struct RetryAfterRecorder {
     inner: HttpsClient,
     until: Arc<Mutex<Option<SystemTime>>>,
@@ -222,6 +222,14 @@ impl HttpClient for RetryAfterRecorder {
     }
 }
 
+fn dns01<'a>(
+    authorization: &'a mut AuthorizationHandle<'a>,
+) -> Result<ChallengeHandle<'a>, CaError> {
+    authorization
+        .challenge(ChallengeType::Dns01)
+        .ok_or_else(|| CaError::Failed("CA offered no dns-01 challenge".into()))
+}
+
 /// `Retry-After` as delay-seconds or an HTTP date.
 fn retry_after(headers: &HeaderMap) -> Option<SystemTime> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
@@ -231,6 +239,6 @@ fn retry_after(headers: &HeaderMap) -> Option<SystemTime> {
     }
 }
 
-fn failed(error: impl std::fmt::Display) -> CaError {
+fn ca_failure(error: impl std::fmt::Display) -> CaError {
     CaError::Failed(error.to_string())
 }

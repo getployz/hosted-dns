@@ -10,8 +10,8 @@ use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use hosted_dns::{
-    AppState, Ca, CaError, Change, ChangeId, Config, MIGRATOR, RecordSet, RecordType, Zone,
-    ZoneError, reap, router,
+    AppState, Ca, CaError, Change, ChangeId, Config, MIGRATOR, RecordSet, RecordType, TOKEN_LEN,
+    Zone, ZoneError, reap, router,
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -33,6 +33,7 @@ type Sets = HashMap<(String, RecordType), RecordSet>;
 struct FakeZone {
     sets: Arc<Mutex<Sets>>,
     public: Arc<Mutex<Sets>>,
+    fail_next_apply: Arc<Mutex<bool>>,
 }
 
 impl FakeZone {
@@ -66,6 +67,9 @@ impl Zone for FakeZone {
     }
 
     async fn apply(&self, changes: Vec<Change>) -> Result<ChangeId, ZoneError> {
+        if std::mem::take(&mut *self.fail_next_apply.lock().unwrap()) {
+            return Err(ZoneError("Route 53 is down".into()));
+        }
         let mut sets = self.sets.lock().unwrap();
         let mut next = sets.clone();
         for change in changes {
@@ -270,7 +274,7 @@ async fn mint_grants_preferred_suffixed_or_random_labels() {
 
     let (name, token) = h.mint(Some("acme")).await;
     assert_eq!(name, format!("acme.{APEX}"));
-    assert_eq!(token.len(), 40);
+    assert_eq!(token.len(), TOKEN_LEN);
 
     // Taken and reserved labels get a 4-character suffix.
     let (taken, _) = h.mint(Some("acme")).await;
@@ -696,4 +700,56 @@ async fn failed_issuance_still_removes_the_challenge() {
             .values(&format!("_acme-challenge.{name}"), RecordType::Txt),
         None
     );
+}
+
+#[tokio::test]
+async fn reaper_never_frees_a_name_that_asked_for_a_certificate() {
+    let h = harness(100).await;
+    let (name, token) = h.mint(Some("certified")).await;
+    let body = json!({ "csr": csr(&[&name, &format!("*.{name}")]) });
+    let (status, _) = h
+        .authed(Method::POST, &name, "/certificate", &token, Some(body))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // No records were ever published, and the reservation is over 24 hours old.
+    sqlx::query("UPDATE domains SET reserved_at = now() - interval '25 hours'")
+        .execute(&h.db)
+        .await
+        .unwrap();
+    reap(&h.state).await.unwrap();
+
+    let (status, _) = h.authed(Method::POST, &name, "/lease", &token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (reissued, _) = h.mint(Some("certified")).await;
+    assert_ne!(reissued, name);
+}
+
+#[tokio::test]
+async fn reaper_keeps_an_expired_name_when_route53_fails_and_retries() {
+    let h = harness(100).await;
+    let (name, token) = h.mint(Some("stubborn")).await;
+    let records = json!({ "a": ["203.0.113.1"] });
+    assert_eq!(
+        h.put_records(&name, &token, records).await,
+        StatusCode::NO_CONTENT
+    );
+    sqlx::query("UPDATE domains SET lease_expires_at = now() - interval '1 minute'")
+        .execute(&h.db)
+        .await
+        .unwrap();
+
+    *h.zone.fail_next_apply.lock().unwrap() = true;
+    assert!(reap(&h.state).await.is_err());
+    let retired: bool = sqlx::query_scalar("SELECT retired_at IS NOT NULL FROM domains")
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+    assert!(!retired);
+    assert!(h.zone.values(&name, RecordType::A).is_some());
+
+    reap(&h.state).await.unwrap();
+    let (status, _) = h.authed(Method::POST, &name, "/lease", &token, None).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(h.zone.values(&name, RecordType::A), None);
 }
