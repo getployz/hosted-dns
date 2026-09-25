@@ -43,6 +43,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         apex: required("APEX_DOMAIN")?,
         mints_per_hour: optional("MINTS_PER_HOUR")?.unwrap_or(30),
         client_ip_header: optional("CLIENT_IP_HEADER")?,
+        mint_keys: std::env::var("MINT_KEYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .collect(),
     };
     let state = Arc::new(AppState::new(db, zone, ca, config));
 

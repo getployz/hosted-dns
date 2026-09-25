@@ -22,6 +22,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 const APEX: &str = "ployz.test";
+const MINT_KEY: &str = "test-mint-key";
 
 type Sets = HashMap<(String, RecordType), RecordSet>;
 
@@ -176,6 +177,7 @@ async fn harness(mints_per_hour: u32) -> Harness {
         apex: APEX.into(),
         mints_per_hour,
         client_ip_header: Some("x-real-ip".parse().unwrap()),
+        mint_keys: vec!["other-key".into(), MINT_KEY.into()],
     };
     let state = Arc::new(AppState::new(db.clone(), zone.clone(), ca.clone(), config));
     let app = router(Arc::clone(&state))
@@ -309,6 +311,35 @@ async fn mint_is_rate_limited_per_source_ip() {
             )
             .await;
         assert_eq!(status, expected, "{ip}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn mint_key_skips_the_limit_and_a_wrong_key_is_refused() {
+    let h = &harness(1).await;
+    let mint_with = |authorization: Option<&'static str>| {
+        let headers: Vec<(&str, &str)> = authorization
+            .map(|value| ("authorization", value))
+            .into_iter()
+            .collect();
+        async move {
+            h.call(Method::POST, "/domains", &headers, Some(json!({})))
+                .await
+        }
+    };
+    let key = "Bearer test-mint-key";
+
+    // No header: anonymous and limited.
+    assert_eq!(mint_with(None).await.0, StatusCode::CREATED);
+    assert_eq!(mint_with(None).await.0, StatusCode::TOO_MANY_REQUESTS);
+    // A known key bypasses the limit from the same address.
+    assert_eq!(mint_with(Some(key)).await.0, StatusCode::CREATED);
+    assert_eq!(mint_with(Some(key)).await.0, StatusCode::CREATED);
+    // A wrong or malformed key is refused, not treated as anonymous.
+    for wrong in ["Bearer test-mint-kez", "Bearer ", "test-mint-key"] {
+        let (status, body) = mint_with(Some(wrong)).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{wrong}");
+        assert_eq!(body["error"], "unauthorized");
     }
 }
 

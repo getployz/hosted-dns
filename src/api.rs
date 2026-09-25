@@ -37,6 +37,8 @@ pub struct Config {
     pub mints_per_hour: u32,
     /// Header holding the client IP when behind a proxy; the peer address otherwise.
     pub client_ip_header: Option<HeaderName>,
+    /// Bearer keys that let `POST /domains` skip the per-IP limit (hosted Cloud).
+    pub mint_keys: Vec<String>,
 }
 
 /// Shared state for every request.
@@ -98,8 +100,23 @@ async fn mint<Z: Zone, C: Ca>(
     body: Result<Option<Json<MintRequest>>, JsonRejection>,
 ) -> Result<(StatusCode, Json<MintResponse>), ApiError> {
     let body = body.map_err(|rejection| ApiError::BadRequest(rejection.body_text()))?;
-    let client = client_ip(&headers, state.config.client_ip_header.as_ref(), peer.ip());
-    state.mints.check(client)?;
+    if headers.contains_key(header::AUTHORIZATION) {
+        // A caller that presents a key never falls back to anonymous minting.
+        let key = bearer(&headers).ok_or(ApiError::Unauthorized)?;
+        let known = state
+            .config
+            .mint_keys
+            .iter()
+            .fold(false, |known, candidate| {
+                known | constant_time_eq(candidate, key)
+            });
+        if !known {
+            return Err(ApiError::Unauthorized);
+        }
+    } else {
+        let client = client_ip(&headers, state.config.client_ip_header.as_ref(), peer.ip());
+        state.mints.check(client)?;
+    }
     let preferred = body.and_then(|Json(body)| body.preferred);
     let token = label::random_string(TOKEN_LEN);
     let token_hash = hash(&token).await?;
@@ -351,12 +368,7 @@ async fn authenticate(
     name: &str,
     headers: &HeaderMap,
 ) -> Result<DateTime<Utc>, ApiError> {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or(ApiError::Unauthorized)?
-        .to_owned();
+    let token = bearer(headers).ok_or(ApiError::Unauthorized)?.to_owned();
     let row: Option<(String, Option<DateTime<Utc>>)> =
         sqlx::query_as("SELECT token_hash, retired_at FROM domains WHERE name = $1 FOR UPDATE")
             .bind(name)
@@ -383,6 +395,24 @@ async fn authenticate(
     .fetch_one(&mut *tx)
     .await?;
     Ok(lease_expires_at)
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// Compares without an early exit on the first differing byte. Length still
+/// leaks, which says nothing useful about a random key.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0, |diff, (x, y)| diff | (x ^ y))
+            == 0
 }
 
 async fn hash(token: &str) -> Result<String, ApiError> {
