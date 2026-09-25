@@ -34,6 +34,8 @@ pub struct AcmeConfig {
     pub eab_kid: String,
     /// Raw HMAC key bytes (the CA hands them out base64url-encoded).
     pub eab_hmac: Vec<u8>,
+    /// Account contact, e.g. `mailto:ops@example.com`; Google Trust Services requires one.
+    pub contact: String,
 }
 
 /// The production CA.
@@ -79,7 +81,7 @@ impl Acme {
                 let eab =
                     ExternalAccountKey::new(self.config.eab_kid.clone(), &self.config.eab_hmac);
                 let new_account = NewAccount {
-                    contact: &[],
+                    contact: &[self.config.contact.as_str()],
                     terms_of_service_agreed: true,
                     only_return_existing: false,
                 };

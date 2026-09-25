@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eab_hmac: URL_SAFE_NO_PAD
                 .decode(required("ACME_EAB_HMAC_KEY")?.trim_end_matches('='))
                 .map_err(|_| "ACME_EAB_HMAC_KEY is not base64url")?,
+            contact: format!("mailto:{}", required("ACME_CONTACT_EMAIL")?),
         },
         db.clone(),
     );
